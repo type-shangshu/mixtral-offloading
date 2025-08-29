@@ -33,6 +33,7 @@ class OffloadConfig:
     offload_size: int
     buffer_size: int
     offload_per_layer: int
+    cache_strategy: str = "lru"
 
 
 class QuantConfig:
@@ -206,6 +207,7 @@ def build_model(
         main_size=offload_config.main_size,
         offload_size=offload_config.offload_size,
         buffer_size=offload_config.buffer_size,
+        cache_strategy=offload_config.cache_strategy,  # Add this line
     )
     for layer_idx in trange(model_config.num_hidden_layers, desc="Loading experts"):
         curr_layer = model.model.layers[layer_idx]
