@@ -1,13 +1,32 @@
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Iterator, Tuple, List
+from typing import Any, Dict, Optional, Iterator, Tuple, List, TypeVar, Generic
 from collections import deque, defaultdict, OrderedDict
 from .expert_wrapper import MixtralExpertWrapper
+from abc import ABC, abstractmethod
 
 import torch
 from torch import nn
 
 ExpertUID = Any
 
+T = TypeVar('T')
+
+class CachePolicy(ABC, Generic[T]):
+    @abstractmethod
+    def add(self, key: Any, value: T) -> None:
+        pass
+    @abstractmethod
+    def get(self, key: Any) -> T:
+        pass
+    @abstractmethod
+    def remove(self, key: Any) -> T:
+        pass
+    @abstractmethod
+    def choose_to_evict(self) -> T:
+        pass
+    @abstractmethod
+    def __len__(self) -> int:
+        pass
 
 @dataclass(frozen=False)
 class ExpertInfo:
@@ -16,40 +35,104 @@ class ExpertInfo:
     offloaded: bool
     index: int
 
+class LRUPolicy(CachePolicy[T]):
+    def __init__(self):
+        self.cache = OrderedDict()
+    
+    def add(self, key: Any, value: T) -> None:
+        self.cache[key] = value
+        self.cache.move_to_end(key)
+        
+    def get(self, key: Any) -> T:
+        self.cache.move_to_end(key)
+        return self.cache[key]
+        
+    def remove(self, key: Any) -> T:
+        return self.cache.pop(key)
+        
+    def choose_to_evict(self) -> Any:
+        return next(iter(self.cache))
+    
+    def __len__(self) -> int:
+        return len(self.cache)
+
+class LFUPolicy(CachePolicy[T]):
+    def __init__(self):
+        self.cache = {}  # key -> value
+        self.frequencies = defaultdict(set)  # frequency -> set of keys
+        self.key_counts = {}  # key -> frequency
+        self.min_freq = 0
+        
+    def add(self, key: Any, value: T) -> None:
+        self.cache[key] = value
+        self.key_counts[key] = 1
+        self.frequencies[1].add(key)
+        self.min_freq = 1
+        
+    def get(self, key: Any) -> T:
+        freq = self.key_counts[key]
+        self.frequencies[freq].remove(key)
+        if not self.frequencies[freq] and freq == self.min_freq:
+            self.min_freq += 1
+        
+        self.key_counts[key] = freq + 1
+        self.frequencies[freq + 1].add(key)
+        return self.cache[key]
+        
+    def remove(self, key: Any) -> T:
+        freq = self.key_counts[key]
+        self.frequencies[freq].remove(key)
+        if not self.frequencies[freq] and freq == self.min_freq:
+            self.min_freq = min(self.key_counts.values(), default=0)
+        del self.key_counts[key]
+        return self.cache.pop(key)
+        
+    def choose_to_evict(self) -> Any:
+        return next(iter(self.frequencies[self.min_freq]))
+    
+    def __len__(self) -> int:
+        return len(self.cache)
 
 @dataclass
 class EvictionGroupInfo:
-    # infos in main and offload devices; ordered from least recently used to most
-    main_infos: OrderedDict[ExpertUID, ExpertInfo] = field(default_factory=OrderedDict)
-    offloaded_infos: OrderedDict[ExpertUID, ExpertInfo] = field(default_factory=OrderedDict)
+    cache_policy: str = "lru"  # "lru" or "lfu"
+    main_policy: CachePolicy[ExpertInfo] = field(init=False)
+    offloaded_policy: CachePolicy[ExpertInfo] = field(init=False)
     hits: int = field(default=0)
     misses: int = field(default=0)
-
+    
+    def __post_init__(self):
+        PolicyClass = LRUPolicy if self.cache_policy == "lru" else LFUPolicy
+        self.main_policy = PolicyClass()
+        self.offloaded_policy = PolicyClass()
+    
     def add(self, info: ExpertInfo):
-        infos_odict = self.offloaded_infos if info.offloaded else self.main_infos
-        assert info.uid not in infos_odict, f"expert {info.uid} already exists"
-        infos_odict[info.uid] = info
-
+        policy = self.offloaded_policy if info.offloaded else self.main_policy
+        policy.add(info.uid, info)
+    
     def choose_expert_to_evict(self) -> ExpertInfo:
-        for uid, info in self.main_infos.items():
-            return info  # least recently used
-        raise ValueError("No evictable experts")
-
+        try:
+            uid = self.main_policy.choose_to_evict()
+            return self.main_policy.get(uid)
+        except StopIteration:
+            raise ValueError("No evictable experts")
+    
     def swap(self, info_to_load: ExpertInfo, info_to_evict: ExpertInfo):
-        assert info_to_load.uid in self.offloaded_infos and info_to_evict.uid in self.main_infos
-        self.main_infos[info_to_load.uid] = self.offloaded_infos.pop(info_to_load.uid)
-        self.main_infos.move_to_end(info_to_load.uid, last=True)
-        self.offloaded_infos[info_to_evict.uid] = self.main_infos.pop(info_to_evict.uid)
-
+        self.main_policy.add(info_to_load.uid, info_to_load)
+        self.offloaded_policy.add(info_to_evict.uid, info_to_evict)
+        self.main_policy.remove(info_to_evict.uid)
+        self.offloaded_policy.remove(info_to_load.uid)
+    
     def mark_used(self, info: ExpertInfo):
-        if info.uid in self.main_infos:
-            self.main_infos.move_to_end(info.uid, last=True)
+        try:
+            self.main_policy.get(info.uid)
             self.hits += 1
-        elif info.uid in self.offloaded_infos:
-            self.offloaded_infos.move_to_end(info.uid, last=True)
-            self.misses += 1
-        else:
-            raise ValueError(f"Expert {info} not in group")
+        except KeyError:
+            try:
+                self.offloaded_policy.get(info.uid)
+                self.misses += 1
+            except KeyError:
+                raise ValueError(f"Expert {info} not in group")
 
 
 class ExpertCache:
@@ -72,7 +155,8 @@ class ExpertCache:
         self.device_expert_buffers = deque([self._check_module(make_module()) for _ in range(buffer_size)])
         self.offloaded_storage_buffers = deque([
             torch.UntypedStorage(self.module_size).pin_memory(self.device) for _ in range(buffer_size)])
-        self.group_infos: Dict[int, EvictionGroupInfo] = defaultdict(EvictionGroupInfo)
+        # self.group_infos: Dict[int, EvictionGroupInfo] = defaultdict(EvictionGroupInfo)
+        self.group_infos: Dict[int, EvictionGroupInfo] = defaultdict(lambda: EvictionGroupInfo(cache_policy="lfu"))
 
     def _check_module(self, module: MixtralExpertWrapper):
         assert isinstance(module.storage, torch.UntypedStorage)
@@ -153,7 +237,7 @@ class ExpertCache:
             infos_in_loading = deque([])
             experts_in_loading = deque([])
             window_size = min(len(self.device_expert_buffers) - 1,
-                              len(eviction_group.main_infos),
+                              len(eviction_group.main_policy),
                               len(infos_to_load))
             for _ in range(window_size):
                 info_to_load = infos_to_load.popleft()
