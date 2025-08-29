@@ -136,7 +136,7 @@ class EvictionGroupInfo:
 
 
 class ExpertCache:
-    def __init__(self, make_module: callable, main_size: int, offload_size: int, buffer_size: int):
+    def __init__(self, make_module: callable, main_size: int, offload_size: int, buffer_size: int, cache_strategy: str = "lru"):
         """Dynamically loads an array of modules with identical hyperparameters"""
         self.module_type = self.module_size = self.device = None
         self.active = False
@@ -156,7 +156,7 @@ class ExpertCache:
         self.offloaded_storage_buffers = deque([
             torch.UntypedStorage(self.module_size).pin_memory(self.device) for _ in range(buffer_size)])
         # self.group_infos: Dict[int, EvictionGroupInfo] = defaultdict(EvictionGroupInfo)
-        self.group_infos: Dict[int, EvictionGroupInfo] = defaultdict(lambda: EvictionGroupInfo(cache_policy="lfu"))
+        self.group_infos: Dict[int, EvictionGroupInfo] = defaultdict(lambda: EvictionGroupInfo(cache_policy=cache_strategy))
 
     def _check_module(self, module: MixtralExpertWrapper):
         assert isinstance(module.storage, torch.UntypedStorage)
