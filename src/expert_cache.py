@@ -7,6 +7,8 @@ from abc import ABC, abstractmethod
 import torch
 from torch import nn
 
+import random
+
 ExpertUID = Any
 
 T = TypeVar('T')
@@ -35,6 +37,27 @@ class ExpertInfo:
     offloaded: bool
     index: int
 
+class RRPolicy(CachePolicy[T]):
+    def __init__(self):
+        self.cache = {}
+    
+    def add(self, key: Any, value: T) -> None:
+        self.cache[key] = value
+
+    def get(self, key: Any) -> T:
+        return self.cache[key]
+    
+    def remove(self, key: Any) -> T:
+        return self.cache.pop(key)
+    
+    def choose_to_evict(self) -> Any:
+        if not self.cache:
+            raise StopIteration("Cache is empty")
+        return random.choice(list(self.cache.keys()))
+    
+    def __len__(self) -> int:
+        return len(self.cache)
+    
 class LRUPolicy(CachePolicy[T]):
     def __init__(self):
         self.cache = OrderedDict()
@@ -95,14 +118,23 @@ class LFUPolicy(CachePolicy[T]):
 
 @dataclass
 class EvictionGroupInfo:
-    cache_policy: str = "lru"  # "lru" or "lfu"
+    cache_policy: str = field(default="lru") # "lru", "random" or "lfu"
     main_policy: CachePolicy[ExpertInfo] = field(init=False)
     offloaded_policy: CachePolicy[ExpertInfo] = field(init=False)
     hits: int = field(default=0)
     misses: int = field(default=0)
     
     def __post_init__(self):
-        PolicyClass = LRUPolicy if self.cache_policy == "lru" else LFUPolicy
+        print(self.cache_policy)
+        if self.cache_policy == "lru":
+            PolicyClass = LRUPolicy
+        elif self.cache_policy == "lfu":
+            PolicyClass = LFUPolicy
+        elif self.cache_policy == "random":
+            PolicyClass = RRPolicy
+        else:
+            raise ValueError(f"Unknown cache policy: {self.cache_policy}")
+        # PolicyClass = LRUPolicy if self.cache_policy == "lru" else LFUPolicy
         self.main_policy = PolicyClass()
         self.offloaded_policy = PolicyClass()
     
