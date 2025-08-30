@@ -125,7 +125,7 @@ class EvictionGroupInfo:
     misses: int = field(default=0)
     
     def __post_init__(self):
-        print(self.cache_policy)
+        # print(self.cache_policy)
         if self.cache_policy == "lru":
             PolicyClass = LRUPolicy
         elif self.cache_policy == "lfu":
@@ -166,6 +166,36 @@ class EvictionGroupInfo:
             except KeyError:
                 raise ValueError(f"Expert {info} not in group")
 
+    def switch_policy(self, new_policy: str):
+        """Switch to a new cache policy while preserving cached items"""
+        if new_policy == self.cache_policy:
+            return
+            
+        # 创建新的策略实例
+        if new_policy == "lru":
+            NewPolicyClass = LRUPolicy
+        elif new_policy == "lfu":
+            NewPolicyClass = LFUPolicy
+        elif new_policy == "random":
+            NewPolicyClass = RRPolicy
+        else:
+            raise ValueError(f"Unknown cache policy: {new_policy}")
+            
+        # 保存当前缓存的items
+        main_items = [(k, v) for k, v in self.main_policy.cache.items()]
+        offload_items = [(k, v) for k, v in self.offloaded_policy.cache.items()]
+        
+        # 创建新的策略实例
+        self.main_policy = NewPolicyClass()
+        self.offloaded_policy = NewPolicyClass()
+        
+        # 重新添加items
+        for k, v in main_items:
+            self.main_policy.add(k, v)
+        for k, v in offload_items:
+            self.offloaded_policy.add(k, v)
+            
+        self.cache_policy = new_policy
 
 class ExpertCache:
     def __init__(self, make_module: callable, main_size: int, offload_size: int, buffer_size: int, cache_strategy: str = "lru"):
@@ -315,3 +345,10 @@ class ExpertCache:
         info_to_evict.index, info_to_load.index = info_to_load.index, info_to_evict.index
         self.group_infos[info_to_load.eviction_group].swap(info_to_load, info_to_evict)
         return device_expert_buffer
+
+    def switch_cache_strategy(self, new_strategy: str):
+        """Switch cache strategy for all eviction groups"""
+        print(f"Switching cache strategy from {self.cache_strategy} to {new_strategy}")
+        self.cache_strategy = new_strategy
+        for group_info in self.group_infos.values():
+            group_info.switch_policy(new_strategy)
