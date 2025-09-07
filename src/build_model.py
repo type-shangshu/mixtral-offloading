@@ -33,7 +33,7 @@ class OffloadConfig:
     offload_size: int
     buffer_size: int
     offload_per_layer: int
-    cache_strategy: str = "lru"
+    cache_strategy: str
 
 
 class QuantConfig:
